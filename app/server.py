@@ -23,6 +23,7 @@ if hasattr(sys, "set_int_max_str_digits"):
     sys.set_int_max_str_digits(0)
 
 from app.diophantine import solve_diophantine
+from app.optimize import optimize_correction
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = (BASE_DIR / "static").resolve()
@@ -115,7 +116,105 @@ def parse_payload(data) -> tuple[list[str], list[list[int]], list[int]]:
     return variables, matrix, target
 
 
-def build_review_response(variables, matrix, target) -> dict:
+def parse_preferences(data, variables: list[str]):
+    """Parse the optional preferred-shim audit settings.
+
+    Returns ``None`` when the key is absent (the plain review behaviour is
+    then byte-for-byte unchanged).  Otherwise every declared variable must
+    appear exactly once with an integer ``preferred`` shim count and a
+    positive integer ``weight``; any missing, duplicated, non-integer or
+    non-positive entry is rejected with HTTP 400.
+    """
+    raw = data.get("preferences")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise RequestError("preferences 必须是数组")
+    entries: dict[str, tuple[int, int]] = {}
+    for k, entry in enumerate(raw):
+        where = f"首选设置第 {k + 1} 项"
+        if not isinstance(entry, dict):
+            raise RequestError(f"{where}必须是对象")
+        name = entry.get("variable")
+        if not isinstance(name, str) or not name.strip():
+            raise RequestError(f"{where}的变量标识缺失或不是字符串")
+        name = name.strip()
+        if name not in variables:
+            raise RequestError(f"{where}引用了未声明的变量 “{name}”")
+        if name in entries:
+            raise RequestError(f"变量 “{name}” 的首选设置重复")
+        if "preferred" not in entry:
+            raise RequestError(f"变量 “{name}” 的首选值缺失")
+        preferred = parse_integer(entry["preferred"], f"变量 “{name}” 的首选值")
+        if "weight" not in entry:
+            raise RequestError(f"变量 “{name}” 的权重缺失")
+        weight = parse_integer(entry["weight"], f"变量 “{name}” 的权重")
+        if weight <= 0:
+            raise RequestError(f"变量 “{name}” 的权重必须为正整数")
+        entries[name] = (preferred, weight)
+    for name in variables:
+        if name not in entries:
+            raise RequestError(f"变量 “{name}” 的首选值缺失")
+    return [entries[name] for name in variables]
+
+
+def _rational_payload(value) -> dict:
+    return {"numerator": str(value.numerator), "denominator": str(value.denominator)}
+
+
+def build_optimization_payload(variables, preferences, opt) -> dict:
+    """Serialise the exact closest-lattice-point audit with its evidence."""
+    return {
+        "preferred": [
+            {"variable": name, "preferred": str(pref), "weight": str(weight)}
+            for name, (pref, weight) in zip(variables, preferences)
+        ],
+        "correction": [str(value) for value in opt.correction],
+        "adjustments": [str(value) for value in opt.adjustments],
+        "perItemCost": [str(value) for value in opt.per_item_cost],
+        "cost": str(opt.cost),
+        "coordinates": [str(value) for value in opt.coordinates],
+        "tieBreak": "lexicographic_adjustment",
+        "evidence": {
+            "method": "exact_lll_fincke_pohst_ldl",
+            "gram": [[str(value) for value in row] for row in opt.gram],
+            "linear": [str(value) for value in opt.linear],
+            "constant": str(opt.constant),
+            "basisTransform": [
+                [str(value) for value in row] for row in opt.basis_transform
+            ],
+            "reducedCoordinates": [str(value) for value in opt.reduced_coordinates],
+            "lower": [
+                [_rational_payload(value) for value in row] for row in opt.lower
+            ],
+            "diagonal": [_rational_payload(value) for value in opt.diagonal],
+            "rationalMinimum": _rational_payload(opt.rational_minimum),
+            "particularCost": str(opt.constant),
+            "finalBound": str(opt.cost),
+            "levels": [
+                {
+                    "level": entry.level,
+                    "low": str(entry.low),
+                    "high": str(entry.high),
+                    "chosen": str(entry.chosen),
+                    "accumulated": {
+                        "numerator": str(entry.accumulated_num),
+                        "denominator": str(entry.accumulated_den),
+                    },
+                }
+                for entry in opt.level_evidence
+            ],
+            "stats": {
+                "nodesVisited": opt.nodes_visited,
+                "nodesPruned": opt.nodes_pruned,
+                "leavesEvaluated": opt.leaves_evaluated,
+                "tiesCompared": opt.ties_compared,
+            },
+        },
+    }
+
+
+def build_review_response(variables, matrix, target, preferences=None) -> dict:
     result = solve_diophantine(matrix, target)
     body = {
         "ok": True,
@@ -158,6 +257,15 @@ def build_review_response(variables, matrix, target) -> dict:
         body["homogeneousBasis"] = [
             [str(value) for value in vector] for vector in result.homogeneous_basis
         ]
+        if preferences is not None:
+            preferred = [value for value, _ in preferences]
+            weights = [value for _, value in preferences]
+            opt = optimize_correction(
+                result.solution, result.homogeneous_basis, preferred, weights
+            )
+            body["optimization"] = build_optimization_payload(
+                variables, preferences, opt
+            )
     else:
         obstruction = result.obstruction
         u_terms = [
@@ -240,11 +348,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             variables, matrix, target = parse_payload(data)
+            preferences = parse_preferences(data, variables)
         except RequestError as exc:
             self._send_json(400, {"ok": False, "error": str(exc)})
             return
         try:
-            self._send_json(200, build_review_response(variables, matrix, target))
+            self._send_json(
+                200,
+                build_review_response(variables, matrix, target, preferences),
+            )
         except Exception as exc:  # pragma: no cover - defensive
             self._send_json(500, {"ok": False, "error": f"服务器内部错误：{exc}"})
 

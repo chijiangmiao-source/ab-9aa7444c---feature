@@ -6,6 +6,9 @@ Order of checks (mirrors the acceptance contract):
      the review API (with a target beyond the IEEE-754 safe-integer range).
   2. Run the code test-suite and the build checks.
   3. HTTP smoke-test the health path and the review endpoint.
+  4. Exercise the preferred-shim optimal-correction audit: exact weighted
+     optimum, lexicographic tie adjudication, rejection of malformed
+     preference settings, and unchanged behaviour without preferences.
 The process exit code reports the overall result: 0 = pass, 1 = fail.
 """
 
@@ -180,6 +183,129 @@ def step3_http_smoke() -> None:
           f"status={status} body={body!r}"[:300])
 
 
+def step4_preferred_audit() -> None:
+    print("\n== 步骤 4：优选校正审计 ==", flush=True)
+
+    # x + 2y = 3，首选 (0, 0)、权重 (1, 1)：可行解 x = 3 - 2y，
+    # 代价 (3-2y)^2 + y^2 在 y = 1 处取最小值 2，最优校正量 (1, 1)。
+    status, body = post_review(
+        {
+            "variables": ["x", "y"],
+            "matrix": [["1", "2"]],
+            "target": ["3"],
+            "preferences": [
+                {"variable": "x", "preferred": "0", "weight": "1"},
+                {"variable": "y", "preferred": "0", "weight": "1"},
+            ],
+        }
+    )
+    opt = (body or {}).get("optimization") or {}
+    check("带首选设置的复核返回 HTTP 200", status == 200, f"status={status}")
+    check("审计给出精确最优校正量 (1, 1)",
+          opt.get("correction") == ["1", "1"], f"optimization={opt!r}"[:400])
+    check("逐项偏差为 (1, 1)", opt.get("adjustments") == ["1", "1"])
+    check("逐项加权平方偏差为 (1, 1)", opt.get("perItemCost") == ["1", "1"])
+    check("总成本精确为 2", opt.get("cost") == "2")
+    evidence = opt.get("evidence") or {}
+    check("最优界证据的最终界等于总成本", evidence.get("finalBound") == "2")
+    levels = evidence.get("levels") or []
+    check("最优界证据覆盖全部自由坐标层", len(levels) == 1,
+          f"levels={levels!r}"[:300])
+    if levels:
+        level = levels[0]
+        check("最优坐标落在证据枚举区间内",
+              int(level["low"]) <= int(level["chosen"]) <= int(level["high"]))
+
+    # x + y = 1，首选 (0, 0)、权重 (1, 1)：(0, 1) 与 (1, 0) 同值，
+    # 按变量标识顺序的调整量字典序应裁决为调整量 (0, 1)。
+    status, body = post_review(
+        {
+            "variables": ["x", "y"],
+            "matrix": [["1", "1"]],
+            "target": ["1"],
+            "preferences": [
+                {"variable": "x", "preferred": "0", "weight": "1"},
+                {"variable": "y", "preferred": "0", "weight": "1"},
+            ],
+        }
+    )
+    opt = (body or {}).get("optimization") or {}
+    check("同值候选按调整量字典序裁决（调整量 (0, 1)）",
+          status == 200 and opt.get("adjustments") == ["0", "1"],
+          f"status={status} optimization={opt!r}"[:400])
+
+    # 权重决定偏差分配：x + y = 2，首选 (0, 0)，y 权重 100 -> (2, 0)。
+    status, body = post_review(
+        {
+            "variables": ["x", "y"],
+            "matrix": [["1", "1"]],
+            "target": ["2"],
+            "preferences": [
+                {"variable": "x", "preferred": "0", "weight": "1"},
+                {"variable": "y", "preferred": "0", "weight": "100"},
+            ],
+        }
+    )
+    opt = (body or {}).get("optimization") or {}
+    check("权重引导偏差分配（最优校正量 (2, 0)，成本 4）",
+          status == 200 and opt.get("correction") == ["2", "0"]
+          and opt.get("cost") == "4",
+          f"status={status} optimization={opt!r}"[:400])
+
+    # 非法首选设置一律拒绝（HTTP 400）。
+    base = {"variables": ["x", "y"], "matrix": [["1", "1"]], "target": ["2"]}
+    bad_cases = {
+        "首选值缺失": [{"variable": "x", "preferred": "0", "weight": "1"}],
+        "变量重复": [
+            {"variable": "x", "preferred": "0", "weight": "1"},
+            {"variable": "x", "preferred": "1", "weight": "1"},
+        ],
+        "首选值非整数": [
+            {"variable": "x", "preferred": "0.5", "weight": "1"},
+            {"variable": "y", "preferred": "1", "weight": "1"},
+        ],
+        "权重非正（零）": [
+            {"variable": "x", "preferred": "0", "weight": "0"},
+            {"variable": "y", "preferred": "1", "weight": "1"},
+        ],
+        "权重非正（负）": [
+            {"variable": "x", "preferred": "0", "weight": "-2"},
+            {"variable": "y", "preferred": "1", "weight": "1"},
+        ],
+    }
+    for name, preferences in bad_cases.items():
+        payload = dict(base)
+        payload["preferences"] = preferences
+        status, body = post_review(payload)
+        check(f"非法首选设置被拒绝（{name}，HTTP 400）",
+              status == 400 and bool(body) and body.get("ok") is False
+              and "optimization" not in (body or {}),
+              f"status={status} body={body!r}"[:300])
+
+    # 未填写首选设置：既有复核响应保持不变（无 optimization 键）。
+    status, body = post_review(base)
+    check("未填写首选设置时复核响应保持不变",
+          status == 200 and bool(body) and "optimization" not in body,
+          f"status={status}")
+
+    # 方程无解：保留既有除尽障碍，不产生优选结论。
+    status, body = post_review(
+        {
+            "variables": ["x", "y"],
+            "matrix": [["2", "0"], ["0", "2"]],
+            "target": ["3", "4"],
+            "preferences": [
+                {"variable": "x", "preferred": "0", "weight": "1"},
+                {"variable": "y", "preferred": "1", "weight": "1"},
+            ],
+        }
+    )
+    check("无解时保留除尽障碍且不产生优选结论",
+          status == 200 and bool(body) and body.get("solvable") is False
+          and "obstruction" in body and "optimization" not in body,
+          f"status={status} body={body!r}"[:300])
+
+
 def main() -> int:
     print(f"验收目标：{APP_BASE_URL}", flush=True)
     if not wait_for_app():
@@ -189,6 +315,7 @@ def main() -> int:
         step1_obstruction_evidence()
         step2_tests_and_build_checks()
         step3_http_smoke()
+        step4_preferred_audit()
 
     print("\n== 验收结论 ==", flush=True)
     if failures:

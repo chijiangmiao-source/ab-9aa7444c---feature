@@ -50,6 +50,21 @@
       <h2 id="result-heading">复核结论</h2>
       <div id="result"></div>
     </section>
+
+    <section class="panel" id="audit-panel" hidden aria-labelledby="audit-heading">
+      <h2 id="audit-heading">优选校正审计</h2>
+      <p class="hint">
+        在全部整数解中精确选出加权平方偏差最小的校正向量：为每项校正填写
+        <strong>首选整数垫片数</strong>与<strong>正整数权重</strong>后发起审计。
+        求解从现有特解与齐次解格做最近格点搜索，全程任意精度整数/有理数界定，
+        最小值相同的候选按变量标识顺序的调整量字典序裁决。
+      </p>
+      <div id="pref-rows"></div>
+      <div class="actions">
+        <button id="audit" type="button" class="primary">发起优选校正审计</button>
+      </div>
+      <div id="audit-result"></div>
+    </section>
   </main>
 
   <script src="./app.js"></script>

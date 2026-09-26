@@ -5,9 +5,11 @@
  * 精确性约定：所有整数在浏览器中始终以十进制字符串保存与展示，
  * 绝不经过 Number 转换，因此超过 2^53 的系数与目标不会丢失精度。
  *
- * 竞态约定：generation 为单调递增的世代号。发起复核、编辑草稿、
- * 取消复核都会使其递增；只有世代号仍为当前值的响应才允许渲染，
- * 过期响应一律丢弃，绝不覆盖当前草稿的状态或结论。
+ * 竞态约定：generation 为方程草稿世代号，auditGeneration 为首选设置
+ * 世代号。编辑方程草稿使两者相关的在途响应全部过期；编辑首选设置
+ * 仅使优选审计响应过期（复核结论不依赖首选设置）。发起复核、发起
+ * 审计、取消都会推进相应世代号；只有世代号仍为当前值的响应才允许
+ * 渲染，过期响应一律丢弃，绝不覆盖当前草稿的状态或结论。
  */
 
 const $ = (id) => document.getElementById(id);
@@ -22,9 +24,16 @@ const cancelButton = $("cancel");
 const statusLine = $("status");
 const resultPanel = $("result-panel");
 const resultBox = $("result");
+const auditPanel = $("audit-panel");
+const prefRows = $("pref-rows");
+const auditButton = $("audit");
+const auditResult = $("audit-result");
 
-let generation = 0; // 草稿/请求世代号
-let inflight = null; // 在途请求的 AbortController
+let generation = 0; // 方程草稿世代号
+let auditGeneration = 0; // 首选设置世代号
+let reviewInFlight = null; // 在途复核的 AbortController
+let auditInFlight = null; // 在途审计的 AbortController
+let latestReview = null; // 最近一次新鲜复核响应（审计以此构造请求）
 
 const INT_PATTERN = /^[+-]?\d+$/;
 
@@ -108,17 +117,54 @@ function markResultsStale() {
     resultPanel.dataset.state = "stale";
     resultPanel.classList.add("stale");
   }
+  markAuditStale();
+}
+
+function markAuditStale() {
+  if (!auditPanel.hidden && auditPanel.dataset.state === "fresh") {
+    auditPanel.dataset.state = "stale";
+    auditPanel.classList.add("stale");
+  }
+}
+
+function abortInflight() {
+  if (reviewInFlight) {
+    reviewInFlight.abort();
+    reviewInFlight = null;
+    cancelButton.disabled = true;
+  }
+  if (auditInFlight) {
+    auditInFlight.abort();
+    auditInFlight = null;
+  }
 }
 
 function invalidateDraft() {
-  generation += 1; // 使任何在途响应立即过期
-  if (inflight) {
-    inflight.abort();
-    inflight = null;
-  }
-  cancelButton.disabled = true;
+  generation += 1; // 使任何在途复核/审计响应立即过期
+  auditGeneration += 1;
+  abortInflight();
+  latestReview = null;
+  latestPayload = null;
+  auditPanel.hidden = true;
   markResultsStale();
   setStatus("草稿已修改：先前计算即使返回也将被丢弃，不会覆盖当前草稿。", "warn");
+}
+
+function invalidatePreferences() {
+  auditGeneration += 1; // 仅使在途优选审计响应过期
+  if (auditInFlight) {
+    auditInFlight.abort();
+    auditInFlight = null;
+  }
+  auditResult.replaceChildren(); // 设置已变：旧优选结论不再可信，立即清除
+  markAuditStale();
+}
+
+function clearAuditOnReject(message) {
+  auditResult.replaceChildren(); // 拒绝时清除旧优选结论
+  auditPanel.dataset.state = "stale";
+  auditPanel.classList.add("stale");
+  setStatus(message, "error");
 }
 
 Object.values(draftFields).forEach((field) =>
@@ -134,11 +180,16 @@ async function runReview() {
     return;
   }
   const myGeneration = ++generation;
-  if (inflight) {
-    inflight.abort();
+  auditGeneration += 1; // 新复核使任何在途审计过期（方程与首选面板都将重建）
+  if (reviewInFlight) {
+    reviewInFlight.abort();
+  }
+  if (auditInFlight) {
+    auditInFlight.abort();
+    auditInFlight = null;
   }
   const controller = new AbortController();
-  inflight = controller;
+  reviewInFlight = controller;
   cancelButton.disabled = false;
   setStatus("复核计算中……", "busy");
   try {
@@ -157,10 +208,13 @@ async function runReview() {
       setStatus(`复核失败：${message}`, "error");
       return;
     }
+    latestReview = data;
+    latestPayload = payload;
     renderResult(data);
     resultPanel.hidden = false;
     resultPanel.dataset.state = "fresh";
     resultPanel.classList.remove("stale");
+    prepareAuditPanel(data);
     setStatus("复核完成。", "ok");
   } catch (error) {
     if (error && error.name === "AbortError") {
@@ -172,7 +226,7 @@ async function runReview() {
     setStatus(`复核请求失败：${error.message || error}`, "error");
   } finally {
     if (myGeneration === generation) {
-      inflight = null;
+      reviewInFlight = null;
       cancelButton.disabled = true;
     }
   }
@@ -180,9 +234,9 @@ async function runReview() {
 
 function cancelReview() {
   generation += 1;
-  if (inflight) {
-    inflight.abort();
-    inflight = null;
+  if (reviewInFlight) {
+    reviewInFlight.abort();
+    reviewInFlight = null;
   }
   cancelButton.disabled = true;
   setStatus("已取消：先前计算若返回将被丢弃，不会覆盖当前草稿的状态或结论。", "warn");
@@ -190,6 +244,251 @@ function cancelReview() {
 
 runButton.addEventListener("click", runReview);
 cancelButton.addEventListener("click", cancelReview);
+
+// ---------------------------------------------------------------- 优选审计
+
+let latestPayload = null; // 最近一次新鲜复核的方程草稿（精确文本）
+
+function prepareAuditPanel(data) {
+  auditResult.replaceChildren();
+  auditPanel.hidden = !data.solvable;
+  if (!data.solvable) {
+    return;
+  }
+  // 重新复核（方程未变）时保留工程师已填的首选值与权重
+  const previous = new Map();
+  prefRows.querySelectorAll('input[data-field]').forEach((node) => {
+    previous.set(`${node.dataset.variable}:${node.dataset.field}`, node.value);
+  });
+  auditPanel.dataset.state = "fresh";
+  auditPanel.classList.remove("stale");
+  prefRows.replaceChildren();
+  const table = el("table", "num pref-table");
+  const head = el("tr");
+  ["变量", "首选整数垫片数", "正整数权重"].forEach((title) =>
+    head.appendChild(el("th", null, title))
+  );
+  table.appendChild(head);
+  data.variables.forEach((name, i) => {
+    const row = el("tr");
+    row.appendChild(el("td", null, name));
+    const preferredCell = el("td");
+    const preferredInput = document.createElement("input");
+    preferredInput.type = "text";
+    preferredInput.spellcheck = false;
+    preferredInput.autocomplete = "off";
+    preferredInput.className = "pref-input num";
+    preferredInput.dataset.field = "preferred";
+    // 默认首选当前复核给出的精确整数解；工程师可逐项改写
+    preferredInput.value = data.solution[i];
+    preferredInput.dataset.variable = name;
+    if (previous.has(`${name}:preferred`)) {
+      preferredInput.value = previous.get(`${name}:preferred`);
+    }
+    preferredInput.addEventListener("input", invalidatePreferences);
+    preferredCell.appendChild(preferredInput);
+    row.appendChild(preferredCell);
+    const weightCell = el("td");
+    const weightInput = document.createElement("input");
+    weightInput.type = "text";
+    weightInput.spellcheck = false;
+    weightInput.autocomplete = "off";
+    weightInput.className = "pref-input num";
+    weightInput.dataset.field = "weight";
+    weightInput.value = "1";
+    weightInput.dataset.variable = name;
+    if (previous.has(`${name}:weight`)) {
+      weightInput.value = previous.get(`${name}:weight`);
+    }
+    weightInput.addEventListener("input", invalidatePreferences);
+    weightCell.appendChild(weightInput);
+    row.appendChild(weightCell);
+    table.appendChild(row);
+  });
+  prefRows.appendChild(table);
+}
+
+function readPreferences() {
+  if (!latestReview || !latestReview.solvable) {
+    throw new Error("请先发起复核并得到可解结论。");
+  }
+  const preferredNodes = prefRows.querySelectorAll('input[data-field="preferred"]');
+  const weightNodes = prefRows.querySelectorAll('input[data-field="weight"]');
+  const preferences = [];
+  for (const name of latestReview.variables) {
+    const prefNode = [...preferredNodes].find((node) => node.dataset.variable === name);
+    const weightNode = [...weightNodes].find((node) => node.dataset.variable === name);
+    const prefRaw = ((prefNode && prefNode.value) || "").trim();
+    if (!prefRaw) {
+      throw new Error(`变量 ${name} 的首选值缺失：已拒绝本次优选审计。`);
+    }
+    const preferredText = parseIntegerToken(prefRaw, `变量 ${name} 的首选值`);
+    const weightRaw = ((weightNode && weightNode.value) || "").trim();
+    if (!weightRaw) {
+      throw new Error(`变量 ${name} 的权重缺失：已拒绝本次优选审计。`);
+    }
+    const weightText = parseIntegerToken(weightRaw, `变量 ${name} 的权重`);
+    if (weightText === "0" || weightText.startsWith("-")) {
+      throw new Error(`变量 ${name} 的权重必须为正整数：已拒绝本次优选审计。`);
+    }
+    preferences.push({ variable: name, preferred: preferredText, weight: weightText });
+  }
+  return preferences;
+}
+
+async function runAudit() {
+  let preferences;
+  try {
+    preferences = readPreferences();
+  } catch (error) {
+    clearAuditOnReject(error.message); // 本地校验拒绝：清除旧优选结论
+    return;
+  }
+  const myGeneration = ++auditGeneration;
+  if (auditInFlight) {
+    auditInFlight.abort();
+  }
+  const controller = new AbortController();
+  auditInFlight = controller;
+  auditButton.disabled = true;
+  setStatus("优选校正审计计算中（精确最近格点搜索）……", "busy");
+  try {
+    const response = await fetch("/api/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...latestPayload, preferences }),
+      signal: controller.signal,
+    });
+    const data = await response.json().catch(() => null);
+    if (myGeneration !== auditGeneration) {
+      return; // 首选设置/方程草稿已变更：丢弃过期审计
+    }
+    if (!response.ok || !data || data.ok !== true) {
+      const message = data && data.error ? data.error : `HTTP ${response.status}`;
+      clearAuditOnReject(`优选审计被拒绝：${message}`); // 服务端拒绝：清除旧优选结论
+      return;
+    }
+    renderAudit(data);
+    auditPanel.dataset.state = "fresh";
+    auditPanel.classList.remove("stale");
+    setStatus("优选校正审计完成：已在全部整数解中精确取得加权偏差最小的校正向量。", "ok");
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      return;
+    }
+    if (myGeneration !== auditGeneration) {
+      return;
+    }
+    setStatus(`优选审计请求失败：${error.message || error}`, "error");
+  } finally {
+    if (myGeneration === auditGeneration) {
+      auditInFlight = null;
+      auditButton.disabled = false;
+    }
+  }
+}
+
+auditButton.addEventListener("click", runAudit);
+
+// ---------------------------------------------------------------- 审计渲染
+
+function renderAudit(data) {
+  auditResult.replaceChildren();
+  const opt = data.optimization;
+  if (!opt) {
+    auditResult.appendChild(
+      el("p", "verdict bad", "审计响应缺少优选结论，请重新发起。")
+    );
+    return;
+  }
+  auditResult.appendChild(
+    el("h3", null, "最优校正向量（精确整数垫片数）")
+  );
+  const table = el("table", "num");
+  const head = el("tr");
+  ["变量", "最优校正量", "首选值", "调整量（最优 − 首选）", "权重", "逐项加权平方偏差"]
+    .forEach((title) => head.appendChild(el("th", null, title)));
+  table.appendChild(head);
+  opt.preferred.forEach((entry, i) => {
+    const row = el("tr");
+    row.appendChild(el("td", null, entry.variable));
+    row.appendChild(el("td", null, opt.correction[i]));
+    row.appendChild(el("td", null, entry.preferred));
+    row.appendChild(el("td", null, opt.adjustments[i]));
+    row.appendChild(el("td", null, entry.weight));
+    row.appendChild(el("td", null, opt.perItemCost[i]));
+    table.appendChild(row);
+  });
+  auditResult.appendChild(table);
+  auditResult.appendChild(
+    el(
+      "p",
+      "verdict ok num",
+      `总成本 = Σ 权重 × 调整量² = ${opt.cost}；同值候选已按变量标识顺序的调整量字典序裁决（${opt.tieBreak}）。`
+    )
+  );
+
+  const details = el("details", "audit-evidence");
+  details.open = true;
+  details.appendChild(el("summary", null, "可复算的最优界证据（LLL 约化 + Fincke–Pohst / 精确有理 LDLᵀ）"));
+  const ev = opt.evidence;
+  details.appendChild(
+    el(
+      "p",
+      "num explanation",
+      `整数二次型 f(t) = tᵀGt + 2hᵀt + c：特解代价（初始界）c = ${ev.constant}，` +
+        `连续最小代价 ρ₀ = ${ev.rationalMinimum.numerator}/${ev.rationalMinimum.denominator}，` +
+        `最终界（最优整数代价）= ${ev.finalBound}。枚举在 LLL 约化坐标 t′ 中进行` +
+        `（t = U·t′，U 幺模），搜索椭球始终以现任可行解的精确代价为界，` +
+        `不使用浮点距离，也不设人为半径。`
+    )
+  );
+  details.appendChild(el("p", "num", "约化 Gram 矩阵 G = UᵀBᵀWBU："));
+  details.appendChild(renderMatrix(ev.gram));
+  details.appendChild(el("p", "num", `约化线性系数 h（线性项为 2hᵀt′）= [${ev.linear.join(", ")}]`));
+  details.appendChild(el("p", "num", "幺模坐标变换 U（t = U·t′）："));
+  details.appendChild(renderMatrix(ev.basisTransform));
+  details.appendChild(
+    el("p", "num", `最优约化坐标 t′ = [${ev.reducedCoordinates.join(", ")}]`)
+  );
+
+  const levelTable = el("table", "num");
+  const levelHead = el("tr");
+  ["层（自由坐标）", "枚举下界", "枚举上界", "最优取值", "截至该层的精确有理代价"]
+    .forEach((title) => levelHead.appendChild(el("th", null, title)));
+  levelTable.appendChild(levelHead);
+  ev.levels.forEach((entry) => {
+    const row = el("tr");
+    row.appendChild(el("td", null, `t_${entry.level + 1}`));
+    row.appendChild(el("td", null, entry.low));
+    row.appendChild(el("td", null, entry.high));
+    row.appendChild(el("td", null, entry.chosen));
+    row.appendChild(
+      el("td", null, `${entry.accumulated.numerator}/${entry.accumulated.denominator}`)
+    );
+    levelTable.appendChild(row);
+  });
+  details.appendChild(levelTable);
+  details.appendChild(
+    el(
+      "p",
+      "num",
+      `枚举统计：访问节点 ${ev.stats.nodesVisited}，剪枝节点 ${ev.stats.nodesPruned}，` +
+        `评估可行候选 ${ev.stats.leavesEvaluated}，同值裁决比较 ${ev.stats.tiesCompared}。`
+    )
+  );
+  auditResult.appendChild(details);
+}
+
+function renderMatrix(rows) {
+  const table = el("table", "num matrix");
+  rows.forEach((row) => {
+    const tr = el("tr");
+    row.forEach((value) => tr.appendChild(el("td", null, value)));
+    table.appendChild(tr);
+  });
+  return table;
+}
 
 function loadExample(example) {
   draftFields.variables.value = example.variables;

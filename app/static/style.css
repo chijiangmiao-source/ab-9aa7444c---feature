@@ -153,6 +153,34 @@ button.ghost {
   opacity: 0.45;
 }
 
+#audit-panel.stale {
+  opacity: 0.45;
+}
+
+.pref-table input.pref-input {
+  width: 100%;
+  background: #0d131b;
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 0.35rem 0.5rem;
+  font-family: var(--mono);
+  font-size: 0.88rem;
+}
+
+.pref-table input.pref-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+#audit-result {
+  margin-top: 1rem;
+}
+
+table.matrix td {
+  text-align: right;
+}
+
 .num,
 .solution-list,
 table {
