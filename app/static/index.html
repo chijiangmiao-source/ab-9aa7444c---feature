@@ -35,12 +35,26 @@
         <textarea id="target" rows="2" spellcheck="false" autocomplete="off"></textarea>
       </label>
 
+      <label class="field optional">
+        <span>首选整数垫片数（可选；与变量一一对应，逐项互不相同。留空则仅做既有复核）</span>
+        <textarea id="preferred" rows="1" spellcheck="false" autocomplete="off"
+          placeholder="例如：1, 2, 0"></textarea>
+      </label>
+
+      <label class="field optional">
+        <span>正整数权重（发起优选审计时与首选值同时逐项填写，逗号或空白分隔）</span>
+        <textarea id="weights" rows="1" spellcheck="false" autocomplete="off"
+          placeholder="例如：1, 2, 1"></textarea>
+      </label>
+
       <div class="actions">
         <button id="run" type="button" class="primary">发起复核</button>
+        <button id="run-optimize" type="button" class="primary">发起优选校正审计</button>
         <button id="cancel" type="button" disabled>取消</button>
         <span class="spacer"></span>
         <button id="load-solvable" type="button" class="ghost">载入可解示例</button>
         <button id="load-unsolvable" type="button" class="ghost">载入无解示例</button>
+        <button id="load-optimize" type="button" class="ghost">载入优选示例</button>
       </div>
 
       <p id="status" role="status" aria-live="polite"></p>

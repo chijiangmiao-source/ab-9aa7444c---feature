@@ -240,3 +240,48 @@ h3 {
   font-size: 0.95rem;
   margin-bottom: 0.4rem;
 }
+
+h4 {
+  font-size: 0.88rem;
+  margin: 0.7rem 0 0.3rem;
+  color: var(--muted);
+}
+
+.field.optional span {
+  color: var(--accent);
+}
+
+.field.optional textarea {
+  padding: 0.45rem 0.7rem;
+}
+
+.optimization {
+  border: 1px solid var(--ok);
+  border-radius: 8px;
+  padding: 0.7rem 1rem;
+  margin: 0.8rem 0 1rem;
+  background: rgba(53, 196, 141, 0.06);
+}
+
+.opt-table td.opt-value {
+  color: var(--ok);
+  font-weight: 700;
+}
+
+.tie-note {
+  color: var(--warn);
+}
+
+.warn-note {
+  border-color: var(--warn) !important;
+  color: var(--warn);
+}
+
+.bound-evidence {
+  background: #0d131b;
+}
+
+.bound-evidence .matrix-evidence td {
+  text-align: right;
+  padding: 0.2rem 0.5rem;
+}

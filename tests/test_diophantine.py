@@ -2,8 +2,14 @@
 
 import random
 import unittest
+from fractions import Fraction
 
-from app.diophantine import smith_normal_form, solve_diophantine
+from app.diophantine import (
+    extended_gcd,
+    integer_kernel_basis,
+    smith_normal_form,
+    solve_diophantine,
+)
 
 
 def matmul(a, b):
@@ -164,6 +170,108 @@ class SolveDiophantineTest(unittest.TestCase):
             for coefficient, value in zip(obstruction.u_row, target)
         )
         self.assertEqual(reconstructed, obstruction.transformed_target)
+
+
+class IntegerKernelBasisTest(unittest.TestCase):
+    def test_extended_gcd_bezout(self):
+        for a, b in ((48, 18), (-48, 18), (0, 7), (7, 0), (-13, -17), (2**80, 3**60)):
+            u, v, g = extended_gcd(a, b)
+            self.assertGreater(g, 0)
+            self.assertEqual(u * a + v * b, g)
+
+    def test_basic_kernels(self):
+        kernel_1d = integer_kernel_basis([[2, 2]])
+        self.assertEqual(len(kernel_1d), 1)
+        self.assertIn(kernel_1d[0], ([-1, 1], [1, -1]))
+        self.assertEqual(integer_kernel_basis([[2, 0], [0, 4]]), [])
+        # zero rows: kernel is the whole space
+        k3 = integer_kernel_basis([[0, 0, 0], [0, 0, 0]])
+        self.assertEqual(sorted(k3), [[0, 0, 1], [0, 1, 0], [1, 0, 0]])
+
+    def test_kernel_vectors_are_in_kernel(self):
+        rng = random.Random(123)
+        for _ in range(100):
+            m = rng.randint(1, 4)
+            n = rng.randint(1, 5)
+            matrix = [[rng.randint(-12, 12) for _ in range(n)] for _ in range(m)]
+            kernel = integer_kernel_basis(matrix)
+            for vector in kernel:
+                for row in matrix:
+                    self.assertEqual(sum(a * b for a, b in zip(row, vector)), 0)
+
+    def test_kernel_equals_smith_lattice(self):
+        """The gcd-built kernel is the full integer kernel (index 1), not a sublattice."""
+        rng = random.Random(456)
+        checked = 0
+        for _ in range(300):
+            m = rng.randint(1, 4)
+            n = rng.randint(1, 5)
+            matrix = [[rng.randint(-9, 9) for _ in range(n)] for _ in range(m)]
+            snf = smith_normal_form(matrix)
+            k = n - snf.rank
+            smith_kernel = [
+                [snf.v[i][j] for i in range(n)] for j in range(snf.rank, n)
+            ]
+            kernel = integer_kernel_basis(matrix)
+            self.assertEqual(len(kernel), k)
+            if k == 0:
+                continue
+            # Express each new-kernel vector in Smith-kernel coordinates;
+            # the coordinate matrix must be unimodular (det +/- 1, integral).
+            coordinates = self._coordinates(kernel, smith_kernel)
+            self.assertTrue(all(x.denominator == 1 for row in coordinates for x in row))
+            self.assertEqual(abs(self._determinant(coordinates)), 1)
+            checked += 1
+        self.assertGreater(checked, 20)
+
+    @staticmethod
+    def _coordinates(vectors, basis):
+        k = len(basis)
+        n = len(basis[0])
+        # Fraction Gaussian elimination on the (full column rank) basis.
+        cols = [[Fraction(basis[j][i]) for j in range(k)] for i in range(n)]
+        result = []
+        for target in vectors:
+            mat = [row[:] for row in cols]
+            rhs = [Fraction(x) for x in target]
+            rank = 0
+            for c in range(k):
+                pivot = next((r for r in range(rank, n) if mat[r][c] != 0), None)
+                if pivot is None:
+                    continue
+                mat[rank], mat[pivot] = mat[pivot], mat[rank]
+                rhs[rank], rhs[pivot] = rhs[pivot], rhs[rank]
+                divisor = mat[rank][c]
+                mat[rank] = [v / divisor for v in mat[rank]]
+                rhs[rank] /= divisor
+                for r in range(n):
+                    if r != rank and mat[r][c] != 0:
+                        factor = mat[r][c]
+                        rhs[r] -= factor * rhs[rank]
+                        mat[r] = [mat[r][j] - factor * mat[rank][j] for j in range(k)]
+                rank += 1
+            result.append(rhs[:k])
+        return result
+
+    @staticmethod
+    def _determinant(matrix):
+        mat = [row[:] for row in matrix]
+        sign = 1
+        for c in range(len(mat)):
+            pivot = next((r for r in range(c, len(mat)) if mat[r][c] != 0), None)
+            if pivot is None:
+                return Fraction(0)
+            if pivot != c:
+                mat[c], mat[pivot] = mat[pivot], mat[c]
+                sign = -sign
+            for r in range(c + 1, len(mat)):
+                factor = mat[r][c] / mat[c][c]
+                for j in range(len(mat)):
+                    mat[r][j] -= factor * mat[c][j]
+        value = Fraction(sign)
+        for i in range(len(mat)):
+            value *= mat[i][i]
+        return value
 
 
 if __name__ == "__main__":

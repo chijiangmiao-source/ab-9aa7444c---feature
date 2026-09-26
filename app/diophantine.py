@@ -154,6 +154,95 @@ class Obstruction:
     u_row: List[int]  # row of U producing the transformed target
 
 
+def integer_kernel_basis(matrix: Sequence[Sequence[int]]) -> List[List[int]]:
+    """An integral basis of ``ker_Z(matrix) = {z in Z^n : matrix z = 0}``.
+
+    Built incrementally, row by row, from exact extended gcds (syzygies):
+    intersecting the current integer column lattice with each homogeneous
+    row keeps every vector integral.  The columns are not reduced here
+    (gcd merging alone keeps entries within a small multiple of the input
+    size); the weighted closest-point optimizer applies its own exact,
+    weighted LLL reduction afterwards.  Returned vectors are columns of
+    the kernel basis.
+    """
+    m = len(matrix)
+    n = len(matrix[0]) if m else 0
+    columns = [[1 if i == j else 0 for i in range(n)] for j in range(n)]
+
+    for row in matrix:
+        projections = [
+            sum(row[i] * column[i] for i in range(n)) for column in columns
+        ]
+        if all(p == 0 for p in projections):
+            continue
+        columns = _kernel_through_row(columns, projections, n)
+    return columns
+
+
+def extended_gcd(a: int, b: int) -> tuple[int, int, int]:
+    """Return ``(u, v, g)`` with ``u*a + v*b = g = gcd(|a|, |b|) > 0``."""
+    old_r, r = a, b
+    old_s, s = 1, 0
+    old_t, t = 0, 1
+    while r:
+        q = old_r // r
+        old_r, r = r, old_r - q * r
+        old_s, s = s, old_s - q * s
+        old_t, t = t, old_t - q * t
+    if old_r < 0:  # normalise to a positive gcd with matching coefficients
+        old_r, old_s, old_t = -old_r, -old_s, -old_t
+    return old_s, old_t, old_r
+
+
+def _kernel_through_row(
+    columns: List[List[int]],
+    projections: Sequence[int],
+    n: int,
+) -> List[List[int]]:
+    """Basis of ``{z in span_Z(columns) : row . z = 0}``.
+
+    The scalar projections ``p_j = row . column_j`` turn this into finding
+    the integer kernel of the single row of scalars; lifting its integer
+    syzygy vectors back through ``columns`` gives the result.
+    """
+    active = [(j, p) for j, p in enumerate(projections) if p != 0]
+    if not active:
+        return [list(c) for c in columns]
+
+    # Sequential exact merge over the (signed) scalar projections.
+    # Invariant: proj(combo) == s, and kernel_coeffs span the syzygies of
+    # the columns merged so far.  Merging scalar s with p via u*s + v*p =
+    # g = gcd(s, p) gives the new combo u*combo + v*e_j and the exact
+    # zero-projection relation (p/g)*combo - (s/g)*e_j.
+    j0, s0 = active[0]
+    s = s0
+    combo = {j0: 1}
+    kernel_coeffs: List[dict] = []
+    for j, p in active[1:]:
+        u, v, g = extended_gcd(s, p)
+        syzygy = {index: (p // g) * value for index, value in combo.items()}
+        syzygy[j] = syzygy.get(j, 0) - s // g
+        kernel_coeffs.append(syzygy)
+        combo = {index: u * value for index, value in combo.items()}
+        combo[j] = combo.get(j, 0) + v
+        s = g
+
+    result: List[List[int]] = []
+    # Columns whose projection was zero survive unchanged.
+    zero_cols = [j for j, p in enumerate(projections) if p == 0]
+    for j in zero_cols:
+        result.append(list(columns[j]))
+    for coefficient_vector in kernel_coeffs:
+        lifted = [0] * n
+        for index, factor in coefficient_vector.items():
+            if factor:
+                for i in range(n):
+                    lifted[i] += factor * columns[index][i]
+        if any(value != 0 for value in lifted):
+            result.append(lifted)
+    return result
+
+
 @dataclass
 class SolveResult:
     solvable: bool
@@ -229,9 +318,15 @@ def solve_diophantine(
         if sum(matrix[i][j] * solution[j] for j in range(n)) != target[i]:
             raise ArithmeticError("内部校验失败：解未复现目标向量")
 
-    basis = [
-        [smith.v[i][j] for i in range(n)] for j in range(smith.rank, n)
-    ]
+    # Short, exactly reduced integer kernel basis (the Smith V columns
+    # also span the kernel, but their entries may be far larger).
+    basis = integer_kernel_basis(matrix)
+    if len(basis) != n - smith.rank:
+        raise ArithmeticError("内部校验失败：齐次解基维数与秩不一致")
+    for vector in basis:
+        for i in range(m):
+            if sum(matrix[i][j] * vector[j] for j in range(n)) != 0:
+                raise ArithmeticError("内部校验失败：齐次向量未落在核内")
     return SolveResult(
         solvable=True,
         solution=solution,

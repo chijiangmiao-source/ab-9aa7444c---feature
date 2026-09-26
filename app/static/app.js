@@ -5,8 +5,8 @@
  * 精确性约定：所有整数在浏览器中始终以十进制字符串保存与展示，
  * 绝不经过 Number 转换，因此超过 2^53 的系数与目标不会丢失精度。
  *
- * 竞态约定：generation 为单调递增的世代号。发起复核、编辑草稿、
- * 取消复核都会使其递增；只有世代号仍为当前值的响应才允许渲染，
+ * 竞态约定：generation 为单调递增的世代号。发起复核/优选审计、编辑草稿、
+ * 取消请求都会使其递增；只有世代号仍为当前值的响应才允许渲染，
  * 过期响应一律丢弃，绝不覆盖当前草稿的状态或结论。
  */
 
@@ -16,8 +16,11 @@ const draftFields = {
   variables: $("variables"),
   matrix: $("matrix"),
   target: $("target"),
+  preferred: $("preferred"),
+  weights: $("weights"),
 };
 const runButton = $("run");
+const runOptimizeButton = $("run-optimize");
 const cancelButton = $("cancel");
 const statusLine = $("status");
 const resultPanel = $("result-panel");
@@ -32,12 +35,27 @@ const EXAMPLE_SOLVABLE = {
   variables: "K1, K2, K3",
   matrix: "9007199254740993 1 0\n1 3 1\n0 2 4",
   target: "18014398509481989, 12, 10",
+  preferred: "",
+  weights: "",
 };
 
 const EXAMPLE_UNSOLVABLE = {
   variables: "D1, D2",
   matrix: "2 0\n0 4",
   target: "9007199254740993, 8",
+  preferred: "",
+  weights: "",
+};
+
+// 欠定系统（2 条耦合约束、3 个校正量），解空间为
+// [0, B, -6B+3] + t·[1, -B, 3B]（B = 9007199254740993）；首选 [1, 2, 0]
+// 与权重 [1, 2, 1] 下，精确加权最近格点为 [2, 3, 1]，总成本 4。
+const EXAMPLE_OPTIMIZE = {
+  variables: "K1, K2, K3",
+  matrix: "9007199254740993 1 0\n1 3 1",
+  target: "18014398509481989, 12",
+  preferred: "1, 2, 0",
+  weights: "1, 2, 1",
 };
 
 // ---------------------------------------------------------------- 草稿解析
@@ -59,7 +77,7 @@ function parseIntegerToken(token, where) {
   return (negative ? "-" : "") + digits;
 }
 
-function readDraft() {
+function readDraft(mode) {
   const variables = splitTokens(draftFields.variables.value);
   if (variables.length === 0) {
     throw new Error("请填写变量标识。");
@@ -93,7 +111,42 @@ function readDraft() {
       `目标向量长度 ${target.length} 与约束条数 ${matrix.length} 不一致。`
     );
   }
-  return { variables, matrix, target };
+  const payload = { variables, matrix, target };
+  if (mode === "optimize") {
+    if (!draftFields.preferred.value.trim()) {
+      throw new Error("发起优选校正审计前，须逐项填写每个机械校正项的首选整数垫片数。");
+    }
+    const preferred = splitTokens(draftFields.preferred.value).map((token, j) =>
+      parseIntegerToken(token, `变量 ${variables[j] || j + 1} 的首选垫片数`)
+    );
+    if (preferred.length !== variables.length) {
+      throw new Error(
+        `首选垫片数有 ${preferred.length} 项，与变量数 ${variables.length} 不一致：须逐项填写且不得留空。`
+      );
+    }
+    if (new Set(preferred).size !== preferred.length) {
+      throw new Error("首选整数垫片数存在重复：每项机械校正的首选值必须互不相同。");
+    }
+    if (!draftFields.weights.value.trim()) {
+      throw new Error("发起优选校正审计前，须逐项填写正整数权重。");
+    }
+    const weights = splitTokens(draftFields.weights.value).map((token, j) =>
+      parseIntegerToken(token, `变量 ${variables[j] || j + 1} 的权重`)
+    );
+    if (weights.length !== variables.length) {
+      throw new Error(
+        `权重有 ${weights.length} 项，与变量数 ${variables.length} 不一致：须逐项填写且不得留空。`
+      );
+    }
+    weights.forEach((token, j) => {
+      if (token.startsWith("-") || token === "0") {
+        throw new Error(`变量 ${variables[j]} 的权重为 ${token}：权重必须是正整数。`);
+      }
+    });
+    payload.preferred = preferred;
+    payload.weights = weights;
+  }
+  return payload;
 }
 
 // ---------------------------------------------------------------- 状态与竞态
@@ -125,10 +178,10 @@ Object.values(draftFields).forEach((field) =>
   field.addEventListener("input", invalidateDraft)
 );
 
-async function runReview() {
+async function runRequest(mode) {
   let payload;
   try {
-    payload = readDraft();
+    payload = readDraft(mode);
   } catch (error) {
     setStatus(error.message, "error");
     return;
@@ -140,9 +193,11 @@ async function runReview() {
   const controller = new AbortController();
   inflight = controller;
   cancelButton.disabled = false;
-  setStatus("复核计算中……", "busy");
+  const endpoint = mode === "optimize" ? "/api/optimize" : "/api/review";
+  const busyText = mode === "optimize" ? "优选校正审计计算中……" : "复核计算中……";
+  setStatus(busyText, "busy");
   try {
-    const response = await fetch("/api/review", {
+    const response = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -154,14 +209,23 @@ async function runReview() {
     }
     if (!response.ok || !data || data.ok !== true) {
       const message = data && data.error ? data.error : `HTTP ${response.status}`;
-      setStatus(`复核失败：${message}`, "error");
+      const prefix = mode === "optimize" ? "优选校正审计被拒绝" : "复核失败";
+      setStatus(`${prefix}：${message}`, "error");
+      // 被拒绝的审计不得留下旧优选结论：仅移除旧结果中的优选区块，
+      // 既有整数复核内容与其过期标记一律保持原样。
+      if (mode === "optimize") {
+        const oldOptimization = resultBox.querySelector(".optimization");
+        if (oldOptimization) {
+          oldOptimization.remove();
+        }
+      }
       return;
     }
     renderResult(data);
     resultPanel.hidden = false;
     resultPanel.dataset.state = "fresh";
     resultPanel.classList.remove("stale");
-    setStatus("复核完成。", "ok");
+    setStatus(mode === "optimize" ? "优选校正审计完成。" : "复核完成。", "ok");
   } catch (error) {
     if (error && error.name === "AbortError") {
       return; // 已被取消或被更新的请求取代
@@ -169,7 +233,7 @@ async function runReview() {
     if (myGeneration !== generation) {
       return;
     }
-    setStatus(`复核请求失败：${error.message || error}`, "error");
+    setStatus(`请求失败：${error.message || error}`, "error");
   } finally {
     if (myGeneration === generation) {
       inflight = null;
@@ -188,19 +252,23 @@ function cancelReview() {
   setStatus("已取消：先前计算若返回将被丢弃，不会覆盖当前草稿的状态或结论。", "warn");
 }
 
-runButton.addEventListener("click", runReview);
+runButton.addEventListener("click", () => runRequest("review"));
+runOptimizeButton.addEventListener("click", () => runRequest("optimize"));
 cancelButton.addEventListener("click", cancelReview);
 
 function loadExample(example) {
   draftFields.variables.value = example.variables;
   draftFields.matrix.value = example.matrix;
   draftFields.target.value = example.target;
+  draftFields.preferred.value = example.preferred;
+  draftFields.weights.value = example.weights;
   invalidateDraft();
-  setStatus("示例已载入，可发起复核。", "");
+  setStatus("示例已载入，可发起复核或优选校正审计。", "");
 }
 
 $("load-solvable").addEventListener("click", () => loadExample(EXAMPLE_SOLVABLE));
 $("load-unsolvable").addEventListener("click", () => loadExample(EXAMPLE_UNSOLVABLE));
+$("load-optimize").addEventListener("click", () => loadExample(EXAMPLE_OPTIMIZE));
 
 // ---------------------------------------------------------------- 结果渲染
 
@@ -234,6 +302,10 @@ function renderSolution(data) {
     list.appendChild(el("li", "num", `${name} = ${data.solution[i]}`));
   });
   resultBox.appendChild(list);
+
+  if (data.optimization) {
+    renderOptimization(data);
+  }
 
   resultBox.appendChild(
     el("h3", null, "约束复核（点选任一约束，查看各项乘积、左侧和及其目标值）")
@@ -290,6 +362,151 @@ function renderSolution(data) {
   }
 }
 
+function signed(value) {
+  return value.startsWith("-") ? value : `+${value}`;
+}
+
+function renderOptimization(data) {
+  const opt = data.optimization;
+  const section = el("section", "optimization");
+  section.appendChild(
+    el(
+      "h3",
+      null,
+      "优选校正审计：在原耦合方程严格成立的全部整数解中，取加权平方偏差最小的校正向量"
+    )
+  );
+
+  const table = el("table", "num opt-table");
+  const head = el("tr");
+  ["变量", "首选垫片数", "权重", "最优校正量", "逐项偏差", "偏差平方", "加权项（权重×偏差²）"].forEach(
+    (title) => head.appendChild(el("th", null, title))
+  );
+  table.appendChild(head);
+  opt.items.forEach((item) => {
+    const row = el("tr");
+    row.appendChild(el("td", null, item.variable));
+    row.appendChild(el("td", null, item.preferred));
+    row.appendChild(el("td", null, item.weight));
+    row.appendChild(el("td", "opt-value", item.optimal));
+    row.appendChild(el("td", null, signed(item.deviation)));
+    row.appendChild(el("td", null, item.deviationSquared));
+    row.appendChild(el("td", null, item.weightedTerm));
+    table.appendChild(row);
+  });
+  section.appendChild(table);
+
+  section.appendChild(
+    el(
+      "p",
+      "verdict ok num",
+      `加权平方偏差总成本 = ${opt.cost}（上表加权项之和，精确整数）`
+    )
+  );
+  const tieText =
+    opt.tieCount > 1
+      ? `最小值共有 ${opt.tieCount} 个候选；${opt.lexicographicRule}。`
+      : "最小值唯一，无需字典序裁决。";
+  section.appendChild(el("p", "num tie-note", tieText));
+
+  const basisCount = data.homogeneousBasis ? data.homogeneousBasis.length : 0;
+  if (basisCount > 0 && opt.coordinates.length === basisCount) {
+    const parts = opt.coordinates
+      .map((z, j) => `(${z})·方向${j + 1}`)
+      .join(" + ");
+    section.appendChild(
+      el(
+        "p",
+        "num explanation",
+        `格坐标复算：最优校正 = 特解 [${data.solution.join(", ")}] + ${parts}`
+      )
+    );
+  }
+
+  section.appendChild(renderBoundEvidence(opt.boundEvidence));
+  resultBox.appendChild(section);
+}
+
+function renderBoundEvidence(evidence) {
+  const details = el("details", "bound-evidence");
+  details.appendChild(
+    el("summary", null, "最优界证据（可复算：初始上界、规约基、Gram-Schmidt、枚举计数）")
+  );
+  details.appendChild(el("p", "explanation", evidence.method));
+
+  const facts = el("table", "num facts");
+  [
+    ["LLL 参数 δ", evidence.delta],
+    ["公分母 Q（整数枚举）", evidence.commonDenominator],
+    ["目标对格空间的正交补常量", evidence.orthogonalResidual],
+    ["Babai 初始界点（格内可行点）", `[${evidence.babaiPoint.join(", ")}]`],
+    ["Babai 界点成本（枚举初始上界）", evidence.babaiCost],
+    ["最优点恰好达到该初始界", evidence.boundAttainedByOptimum ? "是" : "否（枚举中进一步收紧）"],
+    ["枚举访问节点数", String(evidence.enumeration.nodesVisited)],
+    ["完整评估的叶子点数", String(evidence.enumeration.leavesEvaluated)],
+    ["空区间剪枝次数", String(evidence.enumeration.emptyIntervals)],
+    ["比较方式", evidence.enumeration.boundComparison],
+  ].forEach(([key, value]) => {
+    const row = el("tr");
+    row.appendChild(el("th", null, key));
+    row.appendChild(el("td", null, value));
+    facts.appendChild(row);
+  });
+  details.appendChild(facts);
+
+  details.appendChild(
+    el("p", "num", `Babai 规约坐标 ζ = [${evidence.babaiReducedCoordinates.join(", ")}]`)
+  );
+
+  const renderMatrix = (title, rows) => {
+    details.appendChild(el("h4", null, title));
+    const table = el("table", "num matrix-evidence");
+    rows.forEach((r) => {
+      const tr = el("tr");
+      r.forEach((value) => tr.appendChild(el("td", null, value)));
+      table.appendChild(tr);
+    });
+    details.appendChild(table);
+  };
+
+  if (evidence.reducedBasis && evidence.reducedBasis.length > 0) {
+    // Store bases column-major from the server; transpose for display.
+    const k = evidence.reducedBasis.length;
+    const n = evidence.reducedBasis[0].length;
+    const rows = [];
+    for (let i = 0; i < n; i += 1) {
+      rows.push(evidence.reducedBasis.map((column) => column[i]));
+    }
+    renderMatrix(`LLL 规约基（列向量，共 ${k} 个；按变量坐标逐行展示）`, rows);
+    const cRows = [];
+    for (let s = 0; s < k; s += 1) {
+      cRows.push(evidence.coordinateTransform.map((column) => column[s]));
+    }
+    renderMatrix(
+      "幺模坐标变换 C（规约列 ℓ = 原始基 · C[:,ℓ]；原始坐标 = C·ζ）",
+      cRows
+    );
+    renderMatrix("加权 Gram 矩阵 G = B_redᵀ·diag(权重)·B_red", evidence.gram);
+    const gs = evidence.gramSchmidt;
+    const muRows = gs.mu.map((row, i) => {
+      const full = [];
+      for (let j = 0; j < i; j += 1) {
+        full.push(row[j] || "0");
+      }
+      full.push("1");
+      return full;
+    });
+    renderMatrix("Gram-Schmidt 系数 μ（下三角，对角为 1；精确分数）", muRows);
+    renderMatrix(
+      "Gram-Schmidt 正交向量加权平方范数 ‖b*ᵢ‖²_W（精确分数）",
+      [gs.squaredNorms]
+    );
+  } else {
+    details.appendChild(el("p", "num", "齐次解空间为零维：解唯一，无需格搜索，初始界即唯一成本。"));
+  }
+  return details;
+}
+
 function renderConstraintDetail(parent, constraint) {
   parent.replaceChildren();
   const table = el("table", "num");
@@ -323,6 +540,15 @@ function renderObstruction(data) {
   resultBox.appendChild(
     el("p", "verdict bad", "结论：无整数解 —— 存在由可逆整数行变换导出的规范除尽障碍。")
   );
+  if (data.optimization === null) {
+    resultBox.appendChild(
+      el(
+        "p",
+        "explanation warn-note",
+        "已随附首选设置：原方程无整数解，故不产生优选结论；以下既有除尽障碍保持不变。"
+      )
+    );
+  }
   const explanation =
     ob.type === "non_divisible"
       ? `对约束系统施加可逆整数行变换（Smith 正规形 U·A·V = D）后，第 ${
@@ -395,4 +621,4 @@ function renderSmithSummary(smith) {
 // ---------------------------------------------------------------- 初始化
 
 loadExample(EXAMPLE_SOLVABLE);
-setStatus("已载入可解示例，可直接发起复核。", "");
+setStatus("已载入可解示例，可直接发起复核；填写首选值与权重后可发起优选校正审计。", "");
